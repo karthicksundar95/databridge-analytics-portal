@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+app/__init__.py
+app/main.py
+databridge_analytics_service.egg-info/PKG-INFO
+databridge_analytics_service.egg-info/SOURCES.txt
+databridge_analytics_service.egg-info/dependency_links.txt
+databridge_analytics_service.egg-info/entry_points.txt
+databridge_analytics_service.egg-info/requires.txt
+databridge_analytics_service.egg-info/top_level.txt
