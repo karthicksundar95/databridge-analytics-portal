@@ -10,7 +10,11 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://databridge:databridge_dev@localhost:5432/databridge")
-JWT_SECRET = os.getenv("JWT_SECRET", "development-only-secret-change-me")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+DEV_JWT_SECRET = "development-only-secret-change-me"
+JWT_SECRET = os.getenv("JWT_SECRET", DEV_JWT_SECRET)
+if ENVIRONMENT != "development" and (JWT_SECRET == DEV_JWT_SECRET or len(JWT_SECRET) < 32):
+    raise RuntimeError("JWT_SECRET must be at least 32 characters outside development")
 JWT_ALGORITHM = "HS256"
 ORIGINS = [item.strip() for item in os.getenv("CORS_ORIGIN", "").split(",") if item]
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -40,12 +44,22 @@ def database_session():
         yield session
 
 
-def current_analyst(authorization: Optional[str] = Header(default=None)):
+def current_analyst(authorization: Optional[str] = Header(default=None), db: Session = Depends(database_session)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required")
     try:
         user = jwt.decode(authorization.removeprefix("Bearer "), JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.PyJWTError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
+    if not user.get("sub") or not user.get("tokenId"):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
+    session = db.execute(
+        text("""SELECT u.role::text AS role FROM auth_sessions s JOIN users u ON u.id = s.user_id
+                WHERE s.user_id = :user_id AND s.token_id = :token_id
+                  AND s.revoked_at IS NULL AND s.expires_at > NOW() AND u.status = 'active'"""),
+        {"user_id": user["sub"], "token_id": user["tokenId"]},
+    ).mappings().one_or_none()
+    if not session or session["role"] != user.get("role"):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
     if user.get("role") not in {"analyst", "administrator"}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Analytics workspace access required")
@@ -61,7 +75,7 @@ class AssignmentRequest(ApiModel):
 
 
 class StatusRequest(ApiModel):
-    status: str = Field(pattern="^(validating|received|awaiting_assignment|assigned|under_analysis|awaiting_review|completed|failed|rejected)$")
+    status: str = Field(pattern="^(submitted|validating|received|awaiting_assignment|assigned|under_analysis|awaiting_review|completed|failed|rejected|quarantined)$")
 
 
 class NoteRequest(ApiModel):
@@ -93,7 +107,29 @@ def list_submissions(user=Depends(current_analyst), db: Session = Depends(databa
                 GROUP BY s.id, u.email, p.display_name, a.analyst_id
                 ORDER BY s.created_at DESC""")
     ).mappings()
-    return [dict(row) for row in rows]
+    return [{
+        "id": str(row["id"]),
+        "projectName": row["project_name"],
+        "site": row["site"],
+        "countryCode": row["country_code"].strip() if row["country_code"] else None,
+        "status": row["status"],
+        "createdAt": row["created_at"],
+        "clientEmail": row["contributor_email"],
+        "clientName": row["contributor_name"],
+        "fileCount": row["file_count"],
+        "analystId": str(row["analyst_id"]) if row["analyst_id"] else None,
+    } for row in rows]
+
+
+@app.get("/analysts")
+def list_analysts(user=Depends(current_analyst), db: Session = Depends(database_session)):
+    rows = db.execute(
+        text("""SELECT u.id, p.display_name, u.email FROM users u
+                JOIN profiles p ON p.user_id = u.id
+                WHERE u.role = 'analyst' AND u.status = 'active'
+                ORDER BY p.display_name""")
+    ).mappings()
+    return [{"id": str(row["id"]), "displayName": row["display_name"], "email": row["email"]} for row in rows]
 
 
 @app.post("/submissions/{submission_id}/assignment")
@@ -152,9 +188,27 @@ def add_note(submission_id: str, payload: NoteRequest, user=Depends(current_anal
 @app.get("/assignments/mine")
 def my_assignments(user=Depends(current_analyst), db: Session = Depends(database_session)):
     rows = db.execute(
-        text("""SELECT s.id, s.project_name, s.site, s.country_code, s.status, s.created_at
+        text("""SELECT s.id, s.project_name, s.site, s.country_code, s.status, s.created_at,
+                       u.email AS contributor_email, p.display_name AS contributor_name,
+                       COUNT(DISTINCT f.id) AS file_count, a.analyst_id
                 FROM assignments a JOIN submissions s ON s.id = a.submission_id
-                WHERE a.analyst_id = :analyst_id ORDER BY s.created_at DESC"""),
+                JOIN users u ON u.id = s.contributor_id
+                LEFT JOIN profiles p ON p.user_id = u.id
+                LEFT JOIN submission_files f ON f.submission_id = s.id
+                WHERE a.analyst_id = :analyst_id
+                GROUP BY s.id, u.email, p.display_name, a.analyst_id
+                ORDER BY s.created_at DESC"""),
         {"analyst_id": user["sub"]},
     ).mappings()
-    return [dict(row) for row in rows]
+    return [{
+        "id": str(row["id"]),
+        "projectName": row["project_name"],
+        "site": row["site"],
+        "countryCode": row["country_code"].strip() if row["country_code"] else None,
+        "status": row["status"],
+        "createdAt": row["created_at"],
+        "clientEmail": row["contributor_email"],
+        "clientName": row["contributor_name"],
+        "fileCount": row["file_count"],
+        "analystId": str(row["analyst_id"]),
+    } for row in rows]
